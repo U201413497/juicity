@@ -69,6 +69,11 @@ type Server struct {
 	disableOutboundUdp443  bool
 	inFlightUnderlayKey    *InFlightUnderlayKey
 	udpEndpointPool        *UdpEndpointPool
+
+	// Used for graceful shutdown / config reload.
+	pktConn  net.PacketConn
+	listener *quic.Listener
+	closed   chan struct{}
 }
 
 func New(opts *Options) (*Server, error) {
@@ -127,6 +132,7 @@ func New(opts *Options) (*Server, error) {
 		disableOutboundUdp443:  opts.DisableOutboundUdp443,
 		inFlightUnderlayKey:    NewInFlightUnderlayKey(inFlightUnderlayTtl),
 		udpEndpointPool:        NewUdpEndpointPool(),
+		closed:                 make(chan struct{}),
 	}, nil
 }
 
@@ -137,7 +143,7 @@ func (s *Server) Serve(addr string) (err error) {
 	if err != nil {
 		return err
 	}
-	transport := quic.Transport{
+	transport := &quic.Transport{
 		Conn: pktConn,
 	}
 	listener, err := transport.Listen(s.tlsConfig, &quic.Config{
@@ -153,14 +159,23 @@ func (s *Server) Serve(addr string) (err error) {
 		CapabilityCallback:             nil,
 	})
 	if err != nil {
+		_ = pktConn.Close()
 		return err
 	}
+
+	// Save handles so Close() can shut this instance down later.
+	s.pktConn = pktConn
+	s.listener = listener
+
 	go func() {
 		buf := pool.GetFullCap(consts.EthernetMtu)
 		defer buf.Put()
 		for {
 			n, addr, err := transport.ReadNonQUICPacket(context.Background(), buf)
 			if err != nil {
+				if s.isClosed() {
+					return // shut down intentionally, not an error
+				}
 				s.logger.Error().
 					Err(err).
 					Send()
@@ -175,12 +190,15 @@ func (s *Server) Serve(addr string) (err error) {
 						Err(err).
 						Send()
 				}
-			}(&transport, newBuf, addr.(*net.UDPAddr))
+			}(transport, newBuf, addr.(*net.UDPAddr))
 		}
 	}()
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
+			if s.isClosed() {
+				return nil // shut down intentionally, not an error
+			}
 			return err
 		}
 		go func(conn quic.Connection) {
@@ -194,6 +212,35 @@ func (s *Server) Serve(addr string) (err error) {
 					Send()
 			}
 		}(conn)
+	}
+}
+
+// Close gracefully shuts down this Server instance's listener. Already
+// established quic.Connections are not force-closed; they drain naturally.
+// Safe to call multiple times.
+func (s *Server) Close() error {
+	select {
+	case <-s.closed:
+		return nil
+	default:
+		close(s.closed)
+	}
+	var err error
+	if s.listener != nil {
+		err = s.listener.Close()
+	}
+	if s.pktConn != nil {
+		_ = s.pktConn.Close()
+	}
+	return err
+}
+
+func (s *Server) isClosed() bool {
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
 	}
 }
 
