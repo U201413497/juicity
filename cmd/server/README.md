@@ -11,7 +11,7 @@ Multiple platforms and architectures are provited at <https://github.com/juicity
 If you want to build from scratch:
 
 ```shell
-git clone https://github.com/juicity/juicity
+git clone https://github.com/U201413497/juicity
 cd juicity
 make CGO_ENABLED=0 juicity-server
 ```
