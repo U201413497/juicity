@@ -13,7 +13,6 @@ import (
 	"github.com/juicity/juicity/config"
 	"github.com/juicity/juicity/pkg/log"
 	"github.com/juicity/juicity/server"
-
 	"github.com/spf13/cobra"
 )
 
@@ -21,12 +20,12 @@ var (
 	logger = log.NewLogger(&log.Options{
 		TimeFormat: time.DateTime,
 	})
-
 	runCmd = &cobra.Command{
 		Use:   "run",
 		Short: "To run juicity-server in the foreground.",
 		Run: func(cmd *cobra.Command, args []string) {
 			arguments := shared.GetArguments()
+
 			// Config.
 			conf, err := arguments.GetConfig()
 			if err != nil {
@@ -34,7 +33,6 @@ var (
 					Err(err).
 					Msg("Failed to read config")
 			}
-
 			// Logger.
 			if logger, err = arguments.GetLogger(conf.LogLevel); err != nil {
 				logger.Fatal().
@@ -42,16 +40,59 @@ var (
 					Msg("Failed to init logger")
 			}
 
+			curServer, err := newServer(conf)
+			if err != nil {
+				logger.Fatal().
+					Err(err).
+					Msg("Failed to create server")
+			}
 			go func() {
-				if err := Serve(conf); err != nil {
+				if err := curServer.Serve(conf.Listen); err != nil {
 					logger.Fatal().
 						Err(err).
 						Send()
 				}
 			}()
+
 			sigs := make(chan os.Signal, 1)
 			signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGILL)
 			for sig := range sigs {
+				if sig == syscall.SIGHUP {
+					logger.Warn().Msg("Reloading config...")
+
+					newConf, err := arguments.GetConfig()
+					if err != nil {
+						logger.Error().
+							Err(err).
+							Msg("Reload failed: cannot read config, keep old server running")
+						continue
+					}
+
+					newSrv, err := newServer(newConf)
+					if err != nil {
+						logger.Error().
+							Err(err).
+							Msg("Reload failed: cannot build new server, keep old server running")
+						continue
+					}
+
+					// Close the old server first to free the listening port,
+					// then start the new one. Existing connections on the
+					// old server are not force-closed; they drain naturally.
+					_ = curServer.Close()
+					curServer = newSrv
+					go func(srv *server.Server, listen string) {
+						if err := srv.Serve(listen); err != nil {
+							logger.Error().
+								Err(err).
+								Msg("Server stopped")
+						}
+					}(curServer, newConf.Listen)
+
+					logger.Info().Msg("Reload succeeded")
+					continue
+				}
+
 				logger.Warn().
 					Str("signal", sig.String()).
 					Msg("Exiting")
@@ -61,16 +102,20 @@ var (
 	}
 )
 
-func Serve(conf *config.Config) (err error) {
+func newServer(conf *config.Config) (*server.Server, error) {
 	var fwmark uint64
+	var err error
 	if conf.Fwmark != "" {
 		fwmark, err = strconv.ParseUint(conf.Fwmark, 0, 32)
 		if err != nil {
-			return fmt.Errorf("parse fwmark: %w", err)
+			return nil, fmt.Errorf("parse fwmark: %w", err)
 		}
 		if fwmark > math.MaxInt || fwmark > math.MaxUint32 {
-			return fmt.Errorf("fwmark is too large")
+			return nil, fmt.Errorf("fwmark is too large")
 		}
+	}
+	if conf.Listen == "" {
+		return nil, fmt.Errorf(`"Listen" is required`)
 	}
 	s, err := server.New(&server.Options{
 		Logger:                logger,
@@ -84,25 +129,17 @@ func Serve(conf *config.Config) (err error) {
 		DisableOutboundUdp443: conf.DisableOutboundUdp443,
 	})
 	if err != nil {
-		return err
-	}
-	if conf.Listen == "" {
-		return fmt.Errorf(`"Listen" is required`)
+		return nil, err
 	}
 	logger.Info().Msg("Listen at " + conf.Listen)
-	if err = s.Serve(conf.Listen); err != nil {
-		return err
-	}
-	return nil
+	return s, nil
 }
 
 func init() {
 	// version
 	rootCmd.Version = shared.GetVersion(cgoEnabled)
-
 	// cmds
 	rootCmd.AddCommand(runCmd)
-
 	// flags
 	shared.InitArgumentsFlags(runCmd)
 }
