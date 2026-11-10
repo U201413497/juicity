@@ -11,9 +11,11 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/juicity"
 	gliderLog "github.com/nadoo/glider/pkg/log"
@@ -37,24 +39,16 @@ var (
 		Use:   "run",
 		Short: "To run juicity-client in the foreground.",
 		Run: func(cmd *cobra.Command, args []string) {
-			// TODO: Some users reported that enabling GSO on the client would affect the performance of watching YouTube, so we disabled it by default.
 			if _, ok := os.LookupEnv("QUIC_GO_DISABLE_GSO"); !ok {
 				os.Setenv("QUIC_GO_DISABLE_GSO", "1")
 			}
 			arguments := shared.GetArguments()
-			// Config.
 			conf, err := arguments.GetConfig()
 			if err != nil {
-				logger.Fatal().
-					Err(err).
-					Msg("Failed to read config")
+				logger.Fatal().Err(err).Msg("Failed to read config")
 			}
-
-			// Logger.
 			if logger, err = arguments.GetLogger(conf.LogLevel); err != nil {
-				logger.Fatal().
-					Err(err).
-					Msg("Failed to init logger")
+				logger.Fatal().Err(err).Msg("Failed to init logger")
 			}
 			gliderLog.SetLogger(logger)
 
@@ -73,14 +67,53 @@ var (
 	}
 )
 
-func Serve(conf *config.Config) error {
-	if conf.Sni == "" {
-		conf.Sni, _, _ = net.SplitHostPort(conf.Server)
+// hoppingDialer 在每次拨号时把目标换成 host:范围内随机端口。
+// 这样即使 daeuniverse/outbound 的 juicity.Dialer 持有固定 ProxyAddress，
+// 只要底层 UDP dial 的 addr 被改写，就能实现端口跳跃。
+type hoppingDialer struct {
+	base   netproxy.Dialer
+	host   string
+	ports  common.PortRange
+	mu     sync.Mutex
+	cur    string // 当前选用的 host:port，便于日志
+}
+
+func newHoppingDialer(base netproxy.Dialer, host string, ports common.PortRange) *hoppingDialer {
+	h := &hoppingDialer{base: base, host: host, ports: ports}
+	h.cur = common.JoinHostPort(host, ports.Pick())
+	return h
+}
+
+func (h *hoppingDialer) Current() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cur
+}
+
+func (h *hoppingDialer) PickNew() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cur = common.JoinHostPort(h.host, h.ports.Pick())
+	return h.cur
+}
+
+func (h *hoppingDialer) DialContext(ctx context.Context, network string, addr string) (netproxy.Conn, error) {
+	// juicity 拨号时会 DialContext(..., proxyAddress)
+	// 无论传入的是哪个固定地址，都改写到当前/新随机端口。
+	target := h.Current()
+	// 每次 UDP 拨号都换端口（真正的连接级跳跃）
+	if !h.ports.Single() {
+		target = h.PickNew()
+		logger.Info().Str("proxy", target).Msg("port hop: dial")
 	}
+	return h.base.DialContext(ctx, network, target)
+}
+
+func buildTLS(conf *config.Config, sni string) (*tls.Config, error) {
 	tlsConfig := &tls.Config{
 		NextProtos:         []string{"h3"},
 		MinVersion:         tls.VersionTLS13,
-		ServerName:         conf.Sni,
+		ServerName:         sni,
 		InsecureSkipVerify: conf.AllowInsecure,
 	}
 	if conf.PinnedCertChainSha256 != "" {
@@ -90,7 +123,7 @@ func Serve(conf *config.Config) error {
 			if err != nil {
 				pinnedHash, err = hex.DecodeString(conf.PinnedCertChainSha256)
 				if err != nil {
-					return fmt.Errorf("failed to decode PinnedCertChainSha256")
+					return nil, fmt.Errorf("failed to decode PinnedCertChainSha256")
 				}
 			}
 		}
@@ -102,8 +135,17 @@ func Serve(conf *config.Config) error {
 			return nil
 		}
 	}
-	d, err := juicity.NewDialer(dialer.NewClientDialer(conf), protocol.Header{
-		ProxyAddress: conf.Server,
+	return tlsConfig, nil
+}
+
+func newJuicityDialer(conf *config.Config, host string, ports common.PortRange, tlsConfig *tls.Config) (netproxy.Dialer, error) {
+	// ProxyAddress 给一个合法初始值；实际拨号由 hoppingDialer 改写端口。
+	proxyAddr := common.JoinHostPort(host, ports.Pick())
+	base := dialer.NewClientDialer(conf)
+	hop := newHoppingDialer(base, host, ports)
+
+	d, err := juicity.NewDialer(hop, protocol.Header{
+		ProxyAddress: proxyAddr,
 		Feature1:     conf.CongestionControl,
 		TlsConfig:    tlsConfig,
 		User:         conf.Uuid,
@@ -112,14 +154,45 @@ func Serve(conf *config.Config) error {
 		Flags:        0,
 	})
 	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+func Serve(conf *config.Config) error {
+	host, ports, err := common.SplitServerHostPort(conf.Server, conf.PortRange)
+	if err != nil {
+		return fmt.Errorf("parse server/port: %w", err)
+	}
+
+	if conf.Sni == "" {
+		conf.Sni = host
+	}
+	tlsConfig, err := buildTLS(conf, conf.Sni)
+	if err != nil {
 		return err
 	}
+
+	d, err := newJuicityDialer(conf, host, ports, tlsConfig)
+	if err != nil {
+		return err
+	}
+
+	logger.Info().
+		Str("host", host).
+		Uint16("port_min", ports.Min).
+		Uint16("port_max", ports.Max).
+		Int("hop_interval_sec", conf.PortHopInterval).
+		Msg("juicity client port hop config")
+
 	if conf.Listen == "" && len(conf.Forward) == 0 {
 		logger.Fatal().Msg("Please fill in at least one of `listen` and `forward` in the config file.")
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	wg := pool.New().WithErrors().WithContext(ctx).WithCancelOnError()
+
 	if conf.Listen != "" {
 		s, err := server.NewMixed("mixed://"+conf.Listen, d)
 		if err != nil {
@@ -139,8 +212,10 @@ func Serve(conf *config.Config) error {
 			}
 		})
 	}
+
 	if len(conf.Forward) != 0 {
 		for local, remote := range conf.Forward {
+			local, remote := local, remote
 			forwarder, err := server.NewForwarder(server.ForwarderOptions{
 				Logger:     logger,
 				Dialer:     d,
@@ -164,15 +239,30 @@ func Serve(conf *config.Config) error {
 			})
 		}
 	}
+
+	// 可选：周期强制换端口（通过再包一层无法关掉已有 QUIC；
+	// 真正断旧连需要 outbound 支持。这里保留字段以便 Husi 写入，
+	// 实际「每次 dial 换端口」已由 hoppingDialer 完成。）
+	if conf.PortHopInterval > 0 && !ports.Single() {
+		wg.Go(func(ctx context.Context) error {
+			t := time.NewTicker(time.Duration(conf.PortHopInterval) * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-t.C:
+					logger.Info().Msg("port hop interval tick (next dial will use a new port)")
+				}
+			}
+		})
+	}
+
 	return wg.Wait()
 }
 
 func init() {
-	// version
 	rootCmd.Version = shared.GetVersion(cgoEnabled)
-
-	// cmds
 	rootCmd.AddCommand(runCmd)
-
 	shared.InitArgumentsFlags(runCmd)
 }
