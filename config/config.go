@@ -12,6 +12,11 @@ var (
 type Config struct {
 	// Client
 	Server                string            `json:"server"`
+	// PortRange 可选。例如 "50000-50050"。
+	// 若为空，也会尝试从 server 解析 "host:50000-50050" 这种写法。
+	PortRange             string            `json:"port_range,omitempty"`
+	// PortHopInterval 秒。0 表示不主动周期跳，只在每次新建 QUIC 连接时随机端口。
+	PortHopInterval       int               `json:"port_hop_interval,omitempty"`
 	Uuid                  string            `json:"uuid"`
 	Password              string            `json:"password"`
 	Sni                   string            `json:"sni"`
